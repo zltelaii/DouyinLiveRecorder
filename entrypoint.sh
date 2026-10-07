@@ -3,12 +3,16 @@
 set -eu
 
 # 宿主机挂载的 config 目录首次通常是空的，此时用镜像内的默认配置初始化。
-# 否则程序只能读到一份空 config.ini，所有选项走默认值（弹幕抓取会是关闭的）。
-if [ ! -s /app/config/config.ini ]; then
+# 「无效」的判定不能只看文件大小：实测有用户在群晖上新建的 config.ini 只含一个
+# 换行符（1 字节，-s 判定为非空），configparser 读到没有 [section] 头直接崩。
+# 因此只要不存在 / 0 字节 / 没有任何 [节] 头，都强制用默认配置覆盖——
+# 无效内容没有保留价值；注意 cp -rn 不会覆盖已存在文件，所以这里必须显式 -f。
+if [ ! -s /app/config/config.ini ] || ! grep -q '^\[' /app/config/config.ini 2>/dev/null; then
     if [ -d /app/defaults_config ]; then
         mkdir -p /app/config
+        cp -f /app/defaults_config/config.ini /app/config/config.ini
         cp -rn /app/defaults_config/. /app/config/ 2>/dev/null || true
-        echo "[entrypoint] 已将默认配置初始化到 /app/config"
+        echo "[entrypoint] 检测到 config.ini 缺失或内容无效，已用默认配置覆盖"
     fi
 fi
 

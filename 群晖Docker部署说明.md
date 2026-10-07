@@ -134,6 +134,11 @@ GHCR 上搜不到，但 **Docker Hub 上能搜到**——群晖那个搜索框�
 仓库 → **Actions** → 左侧选 **Publish to Docker Hub** → **Run workflow**
 → `image_name` 填 `你的用户名/douyin-live-recorder` → 运行。
 
+> 这个 fork 的默认分支已设为 `feature/douyin-danmaku`（弹幕代码在这条分支上），
+> 所以 Actions 页面能直接看到这个 workflow。若某天列表里找不到它，
+> 用页面上方的分支选择器切到 `feature/douyin-danmaku` 即可——
+> GitHub 只展示默认分支上的 workflow。
+
 跑完（约 2 分钟），群晖上就是：
 
 - **注册表** 里搜 `douyin-live-recorder` → 能搜到，点一下就能下载

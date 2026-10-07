@@ -3,3 +3,5 @@
 *.sh text eol=lf
 Dockerfile text eol=lf
 entrypoint.sh text eol=lf
+# Actions 的 workflow 同样按 LF 存，避免 CRLF 在个别 YAML 解析下出岔子
+.github/workflows/*.yml text eol=lf

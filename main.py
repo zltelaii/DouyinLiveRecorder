@@ -260,7 +260,93 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
         logger.error(f'An unknown error occurred: {e}')
 
 
-def burn_danmaku_into_video(video_path: str, ass_path: str) -> None:
+_ASS_TIME_RE = re.compile(r'^(\d+):(\d{1,2}):(\d{1,2})[.,](\d{1,3})$')
+
+
+def _parse_ass_time(value: str) -> float:
+    """ASS 时间戳 H:MM:SS.cc -> 秒。"""
+    m = _ASS_TIME_RE.match(value.strip())
+    if not m:
+        return 0.0
+    h, minute, second, frac = m.groups()
+    return int(h) * 3600 + int(minute) * 60 + int(second) + float(f'0.{frac}')
+
+
+def _format_ass_time(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int(seconds % 3600 // 60)
+    s = int(seconds % 60)
+    cs = int(round(seconds * 100) % 100)
+    return f'{h:d}:{m:02d}:{s:02d}.{cs:02d}'
+
+
+def probe_video_info(video_path: str) -> tuple:
+    """探测视频起始时间戳与时长，失败返回 (0.0, 0.0)。
+
+    分段录制的片段时间戳未必从 0 开始（取决于 muxer 有没有重置），
+    烧录前要靠它决定要不要平移时间轴。
+    """
+    try:
+        output = subprocess.check_output(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=start_time,duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+            stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
+        )
+        values = output.decode('utf-8', errors='ignore').split()
+        if len(values) >= 2:
+            return float(values[0]), float(values[1])
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def has_ass_events(ass_path: str) -> int:
+    """统计 ASS 里的字幕条数，用于判断这次到底有没有抓到可烧的弹幕。"""
+    try:
+        with open(ass_path, encoding='utf-8') as f:
+            return sum(1 for line in f if line.startswith('Dialogue:'))
+    except OSError:
+        return 0
+
+
+def slice_ass_for_segment(ass_path: str, start_sec: float, duration_sec: float, out_path: str) -> int:
+    """从整场 ASS 裁出「某一段」的字幕。
+
+    分段录制时每个片段是独立文件，而弹幕 ASS 只有一份且按整场时间轴排列，
+    所以要把时间轴整体前移该段的起始位置，并丢掉落在这一段之外的条目。
+    返回保留下来的条数。
+    """
+    try:
+        with open(ass_path, encoding='utf-8') as f:
+            raw = f.read().splitlines()
+    except OSError:
+        return 0
+
+    lines = []
+    for line in raw:
+        if line.startswith('Dialogue:'):
+            # Text 是最后一个字段且允许内含逗号，所以只切前 9 个逗号
+            parts = line.split(',', 9)
+            if len(parts) < 10:
+                continue
+            start = _parse_ass_time(parts[1]) - start_sec
+            end = _parse_ass_time(parts[2]) - start_sec
+            if end <= 0 or start >= duration_sec or end <= start:
+                continue
+            parts[1] = _format_ass_time(max(0.0, start))
+            parts[2] = _format_ass_time(min(end, duration_sec))
+            lines.append(','.join(parts))
+        else:
+            lines.append(line)
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    return sum(1 for line in lines if line.startswith('Dialogue:'))
+
+
+def burn_danmaku_into_video(video_path: str, ass_path: str, video_start: float = 0.0) -> None:
     """把弹幕 ASS 字幕烧进视频画面。
 
     输出到独立的「原名_弹幕.mp4」，**原文件保留**：烧录是整段重编码，
@@ -272,6 +358,10 @@ def burn_danmaku_into_video(video_path: str, ass_path: str) -> None:
         if os.path.getsize(video_path) == 0 or os.path.getsize(ass_path) == 0:
             return
     except OSError:
+        return
+
+    if has_ass_events(ass_path) == 0:
+        logger.warning(f'本次没有抓到任何弹幕，跳过烧录: {ass_path}')
         return
 
     video_path = os.path.abspath(video_path)
@@ -286,8 +376,12 @@ def burn_danmaku_into_video(video_path: str, ass_path: str) -> None:
 
     try:
         color_obj.print_colored(f"正在把弹幕烧进画面 -> {os.path.basename(out_path)}\n", color_obj.YELLOW)
-        ffmpeg_command = [
-            "ffmpeg", "-y", "-i", video_path,
+        ffmpeg_command = ["ffmpeg", "-y"]
+        # 片段时间戳不是从 0 开始时，先把它们拉回原点，字幕时间轴才对得上
+        if video_start > 0.5:
+            ffmpeg_command += ["-itsoffset", f"-{video_start:.3f}"]
+        ffmpeg_command += [
+            "-i", video_path,
             "-vf", f"ass={ass_name}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p",
@@ -313,7 +407,57 @@ def post_process_video(video_path: str, is_original_delete: bool, ass_path: str 
         return
     final_path = video_path.rsplit('.', maxsplit=1)[0] + '.mp4'
     if os.path.exists(final_path):
-        burn_danmaku_into_video(final_path, ass_path)
+        start_time, _duration = probe_video_info(final_path)
+        burn_danmaku_into_video(final_path, ass_path, video_start=start_time)
+
+
+def post_process_segments(segment_template_path: str, is_original_delete: bool, ass_path: str) -> None:
+    """分段录制下的后半程：逐个片段转码 + 烧录各自区间的弹幕。
+
+    必须串行处理：每一段的字幕起点来自它前面所有段的**实际时长累加**
+    （ffmpeg 按关键帧切段，边界不严格等于配置的分段秒数），并行就算不出这个偏移。
+    """
+    directory = os.path.dirname(segment_template_path)
+    prefix = os.path.basename(segment_template_path).rsplit('_', maxsplit=1)[0]
+    video_exts = ('.ts', '.flv', '.mkv', '.mp4')
+    danmaku_exts = ('.danmaku.ass', '.danmaku.srt', '.danmaku.jsonl')
+
+    candidates = []
+    for path in utils.get_file_paths(directory):
+        name = os.path.basename(path)
+        if prefix not in name or '_弹幕' in name:
+            continue
+        if name.endswith(danmaku_exts):
+            continue
+        if os.path.splitext(name)[1].lower() not in video_exts:
+            continue
+        candidates.append(path)
+    candidates.sort()
+
+    if not candidates:
+        logger.warning(f'没有找到待处理的分段视频: {directory}')
+        return
+
+    offset = 0.0
+    for index, path in enumerate(candidates, start=1):
+        converts_mp4(path, is_original_delete)
+        final_path = path.rsplit('.', maxsplit=1)[0] + '.mp4'
+        if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+            continue
+        start_time, duration = probe_video_info(final_path)
+        if duration <= 0:
+            duration = 0.0
+        seg_ass = f'{os.path.splitext(final_path)[0]}.seg{index:03d}.ass'
+        kept = slice_ass_for_segment(ass_path, offset, duration, seg_ass)
+        logger.info(f'第 {index}/{len(candidates)} 段：命中 {kept} 条弹幕，准备烧录')
+        try:
+            burn_danmaku_into_video(final_path, seg_ass, video_start=start_time)
+        finally:
+            try:
+                os.remove(seg_ass)
+            except OSError:
+                pass
+        offset += duration
 
 
 def converts_m4a(converts_file_path: str, is_original_delete: bool = True) -> None:
@@ -553,16 +697,22 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     if return_code == 0:
         if converts_to_mp4 and save_type == 'TS':
             if split_video_by_time:
-                if want_burn:
-                    logger.warning(
-                        '分段录制下不自动烧录弹幕：各段时间轴互相独立，而弹幕 ASS 只有一份'
-                        '（按整场计时），直接烧会整体错位。字幕仍在：' + str(ass_path)
-                    )
-                file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
-                prefix = os.path.basename(save_file_path).rsplit('_', maxsplit=1)[0]
-                for path in file_paths:
-                    if prefix in path:
-                        threading.Thread(target=converts_mp4, args=(path, delete_origin_file)).start()
+                if want_burn and ass_path and os.path.exists(ass_path):
+                    # 分段也能烧：ASS 只有一份且按整场计时，这里为每段单独裁一份再烧，
+                    # 因此必须串行处理（每段的偏移取决于前面各段的实际时长）
+                    logger.info('开启分段录制，将逐段把弹幕烧进画面（每段一次重编码，耗时较长）')
+                    threading.Thread(
+                        target=post_process_segments,
+                        args=(save_file_path, delete_origin_file, ass_path),
+                    ).start()
+                else:
+                    if want_burn:
+                        logger.warning(f'没有拿到弹幕 ASS（{ass_path}），本次只做转码，不烧录字幕')
+                    file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
+                    prefix = os.path.basename(save_file_path).rsplit('_', maxsplit=1)[0]
+                    for path in file_paths:
+                        if prefix in path:
+                            threading.Thread(target=converts_mp4, args=(path, delete_origin_file)).start()
             else:
                 threading.Thread(
                     target=post_process_video,
@@ -708,6 +858,9 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             or json_data.get('web_rid') or '')
                                     if _rid:
                                         danmaku_room_ids[record_url] = str(_rid)
+                                    else:
+                                        logger.warning(
+                                            f'没有取到直播间 room_id，本场不抓取弹幕: {record_url}')
                                 except Exception:
                                     pass
 

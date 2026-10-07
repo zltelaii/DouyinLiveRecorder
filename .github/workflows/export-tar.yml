@@ -46,7 +46,11 @@ jobs:
       - name: 自检（ffmpeg / node 必须都在）
         run: |
           docker run --rm douyin-live-recorder:latest sh -c \
-            'ffmpeg -version | head -1; node --version; python --version'
+            'ffmpeg -version | head -1; node --version; python --version; fc-match "Microsoft YaHei"'
+
+      - name: 自检（中文弹幕必须真的能画到画面上）
+        run: |
+          docker run --rm douyin-live-recorder:latest sh /app/docker/check_subtitle_render.sh
 
       - name: 导出为 tar
         run: |

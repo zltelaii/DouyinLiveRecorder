@@ -27,6 +27,7 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -292,6 +293,17 @@ def _fmt_ass_time(seconds: float) -> str:
     s = int(seconds % 60)
     cs = int(round(seconds * 100) % 100)
     return f'{h:d}:{m:02d}:{s:02d}.{cs:02d}'
+
+
+def ass_font_name() -> str:
+    """ASS 里写死的字体必须真实存在，否则 libass 渲染不出中文。
+
+    Docker/Linux 镜像里没有微软雅黑，直接沿用 Windows 的名字会导致字幕整体不显示；
+    这里按平台挑一个确定装了的字体，并在镜像里额外配了 fontconfig 别名兜底。
+    """
+    if sys.platform.startswith('win'):
+        return 'Microsoft YaHei'
+    return 'WenQuanYi Micro Hei'
 
 
 def clean_base_path(save_file_path: str) -> str:
@@ -780,7 +792,7 @@ class DanmakuRecorder:
             'Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, '
             'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
             # Alignment=8 -> 顶部居中；MarginV=36 -> 距顶边距离；字号 40 -> 每行约占画面 5%
-            'Style: Danmaku,Microsoft YaHei,40,&H00FFFFFF,&H00000000,&H80000000,0,0,1,2,0,8,40,40,36,1\n'
+            f'Style: Danmaku,{ass_font_name()},40,&H00FFFFFF,&H00000000,&H80000000,0,0,1,2,0,8,40,40,36,1\n'
             '\n'
             '[Events]\n'
             'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'

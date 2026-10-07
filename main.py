@@ -71,6 +71,9 @@ danmaku_room_ids = {}
 # 这里不初始化的话，循环尚未执行到配置段时 check_subprocess 会引用到未定义变量
 danmaku_enabled = False
 danmaku_formats = 'json,srt,ass'
+danmaku_burn = False
+danmaku_max_lines = 4
+danmaku_duration = 5.0
 script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
 config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
@@ -255,6 +258,62 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
         logger.error(f'Error occurred during conversion: {e}')
     except Exception as e:
         logger.error(f'An unknown error occurred: {e}')
+
+
+def burn_danmaku_into_video(video_path: str, ass_path: str) -> None:
+    """把弹幕 ASS 字幕烧进视频画面。
+
+    输出到独立的「原名_弹幕.mp4」，**原文件保留**：烧录是整段重编码，
+    耗时和体积都不小，失败或被中断时不该连原始素材一起损失。
+    """
+    if not (os.path.exists(video_path) and os.path.exists(ass_path)):
+        return
+    try:
+        if os.path.getsize(video_path) == 0 or os.path.getsize(ass_path) == 0:
+            return
+    except OSError:
+        return
+
+    video_path = os.path.abspath(video_path)
+    base, ext = video_path.rsplit('.', maxsplit=1)
+    out_path = f'{base}_弹幕.{ext}'
+
+    # ass 滤镜参数里的 Windows 盘符冒号极难转义（实测 `C\:` 会把参数撕碎报
+    # "No option name"，引号包裹、双反斜杠也各有兼容性坑），而弹幕文件和视频
+    # 本来就在同一目录——直接把工作目录切过去用纯文件名引用，彻底绕开这个坑。
+    work_dir = os.path.dirname(ass_path)
+    ass_name = os.path.basename(ass_path)
+
+    try:
+        color_obj.print_colored(f"正在把弹幕烧进画面 -> {os.path.basename(out_path)}\n", color_obj.YELLOW)
+        ffmpeg_command = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", f"ass={ass_name}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-f", ext, out_path,
+        ]
+        subprocess.check_output(
+            ffmpeg_command, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type), cwd=work_dir
+        )
+        color_obj.print_colored(f"弹幕已烧录: {out_path}\n", color_obj.GREEN)
+    except subprocess.CalledProcessError as e:
+        output = getattr(e, 'output', b'') or b''
+        tail = output.decode('utf-8', errors='ignore')[-400:]
+        logger.error(f'弹幕烧录失败: {e}\nffmpeg 输出尾部:\n{tail}')
+    except Exception as e:
+        logger.error(f'弹幕烧录出现未知错误: {e}')
+
+
+def post_process_video(video_path: str, is_original_delete: bool, ass_path: str | None = None) -> None:
+    """转码为 MP4，随后按需把弹幕烧进画面。两者必须串行——烧录的输入是转码产物。"""
+    converts_mp4(video_path, is_original_delete)
+    if not (danmaku_burn and ass_path):
+        return
+    final_path = video_path.rsplit('.', maxsplit=1)[0] + '.mp4'
+    if os.path.exists(final_path):
+        burn_danmaku_into_video(final_path, ass_path)
 
 
 def converts_m4a(converts_file_path: str, is_original_delete: bool = True) -> None:
@@ -442,6 +501,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     'cookie': dy_cookie,
                     'formats': danmaku_formats.split(','),
                     'sync_start': datetime.datetime.now(),
+                    'subtitle_max_lines': danmaku_max_lines,
+                    'subtitle_duration': danmaku_duration,
                 },
                 name=f'danmaku_start_{record_name}',
                 daemon=True,
@@ -479,16 +540,37 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
 
     return_code = process.returncode
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    # 弹幕必须先收尾：ASS 字幕是连接关闭时才落盘的，晚于它的话转码/烧录拿不到文件
+    ass_path = None
+    if danmaku_key:
+        danmaku.stop_danmaku(danmaku_key)
+        if 'ass' in [f.strip().lower() for f in danmaku_formats.split(',')]:
+            ass_path = danmaku.clean_base_path(save_file_path) + '.danmaku.ass'
+
+    want_burn = bool(danmaku_burn and ass_path and '音频' not in save_type)
+
     if return_code == 0:
         if converts_to_mp4 and save_type == 'TS':
             if split_video_by_time:
+                if want_burn:
+                    logger.warning(
+                        '分段录制下不自动烧录弹幕：各段时间轴互相独立，而弹幕 ASS 只有一份'
+                        '（按整场计时），直接烧会整体错位。字幕仍在：' + str(ass_path)
+                    )
                 file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
                 prefix = os.path.basename(save_file_path).rsplit('_', maxsplit=1)[0]
                 for path in file_paths:
                     if prefix in path:
                         threading.Thread(target=converts_mp4, args=(path, delete_origin_file)).start()
             else:
-                threading.Thread(target=converts_mp4, args=(save_file_path, delete_origin_file)).start()
+                threading.Thread(
+                    target=post_process_video,
+                    args=(save_file_path, delete_origin_file, ass_path if want_burn else None),
+                ).start()
+        elif want_burn and not split_video_by_time:
+            # 未开启转码（直接存 mp4/flv 等）时，烧录直接作用于录制产物
+            threading.Thread(target=burn_danmaku_into_video, args=(save_file_path, ass_path)).start()
         print(f"\n{record_name} {stop_time} 直播录制完成\n")
 
         if script_command:
@@ -515,9 +597,6 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
 
     else:
         color_obj.print_colored(f"\n{record_name} {stop_time} 直播录制出错,返回码: {return_code}\n", color_obj.RED)
-
-    if danmaku_key:
-        danmaku.stop_danmaku(danmaku_key)
 
     recording.discard(record_name)
     return False
@@ -1835,7 +1914,18 @@ while True:
                 ini_URL_content = file.read().strip()
 
         if not ini_URL_content.strip():
-            input_url = input('请输入要录制的主播直播间网址（尽量使用PC网页端的直播间地址）:\n')
+            try:
+                input_url = input('请输入要录制的主播直播间网址（尽量使用PC网页端的直播间地址）:\n')
+            except EOFError:
+                # Docker / systemd 这类没有可交互终端的环境：input() 会直接抛 EOFError。
+                # 这里不让容器退出——说清楚地址该填到哪儿，稍后重新读取，
+                # 用户在宿主机上补好后无需重启容器即可继续。
+                logger.error(
+                    '读取直播间地址失败：当前没有可交互的终端（容器环境？）。'
+                    f'请把直播间地址写入 {url_config_file}（每行一个），30 秒后自动重试。'
+                )
+                time.sleep(30)
+                continue
             with open(url_config_file, 'w', encoding=text_encoding) as file:
                 file.write(input_url)
     except OSError as err:
@@ -1868,6 +1958,16 @@ while True:
     create_time_file = options.get(read_config_value(config, '录制设置', '生成时间字幕文件', "否"), False)
     danmaku_enabled = options.get(read_config_value(config, '录制设置', '是否录制弹幕(是/否)', "否"), False)
     danmaku_formats = read_config_value(config, '录制设置', '弹幕保存格式(逗号分隔)', "json,srt,ass")
+    danmaku_burn = options.get(
+        read_config_value(config, '录制设置', '录制完成后自动将弹幕烧录到视频(是/否)', "否"), False)
+    try:
+        danmaku_max_lines = max(1, int(read_config_value(config, '录制设置', '弹幕最多同时显示行数', "4")))
+    except (TypeError, ValueError):
+        danmaku_max_lines = 4
+    try:
+        danmaku_duration = max(1.0, float(read_config_value(config, '录制设置', '弹幕单条显示时长(秒)', "5")))
+    except (TypeError, ValueError):
+        danmaku_duration = 5.0
     if danmaku_enabled:
         logger.info("弹幕录制已开启，当前仅支持抖音直播，若缺少依赖请执行: pip install websocket-client protobuf")
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)

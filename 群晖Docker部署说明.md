@@ -92,60 +92,31 @@ Container Manager → **项目** → **新建** → 来源选「创建 docker-co
 好处是**挂载目录、重启策略、时区全部自带**，不用一个个手填，镜像也会自动拉取。
 群晖会自动在 `/volume1/docker/` 下建目录（你也可以在「位置」里改成自己的路径）。
 
-### 做法 A3：群晖拉不动 GHCR 时，改用本地文件导入
+### 做法 A3：下载打包好的镜像文件（不用联网拉，推荐）
 
-如果群晖访问 `ghcr.io` 超时或失败（国内网络偶发），在一台**能上网且装了 Docker**
-的电脑上先拉下来打包，再传给群晖：
+GitHub 每次构建都会把镜像**导出成一个 .tar 文件**挂在构建详情页里，
+你下载下来传给群晖导入就行——群晖完全不需要访问 `ghcr.io`，也不用配任何凭据。
 
-```bash
-docker pull ghcr.io/zltelaii/douyin-live-recorder:latest
-docker save ghcr.io/zltelaii/douyin-live-recorder:latest -o douyin-recorder.tar
-```
+**第一步：下载**
 
-得到一个 `douyin-recorder.tar`，然后群晖上走
-**映像 → 新增 → 从文件添加**，选这个 tar 即可，不需要联网拉取。
+1. 打开 <https://github.com/zltelaii/DouyinLiveRecorder/actions>
+2. 点列表里 **Export Image Tar** 那一条（最新的）
+3. 拉到页面最下方 **Artifacts** 区域，下载 `douyin-live-recorder-image`
+   （是个 zip，需要登录 GitHub 才能下载）
+4. **解压**，得到里面的 `douyin-live-recorder.tar`
 
-### 做法 C：先把镜像推到 Docker Hub（好处是群晖能搜到）
+**第二步：导入群晖**
 
-GHCR 上搜不到，但 **Docker Hub 上能搜到**——群晖那个搜索框本来就是查 Docker Hub 的。
-如果你就是想「搜一下就能装」，把同一个镜像再推一份到 Docker Hub 即可，
-群里搜 `douyin-live-recorder` 就能出现。
+Container Manager → **映像** → **新增** → **从文件添加** → 选这个 tar。
 
-仓库里已经备好 `.github/workflows/dockerhub.yml`，**只需你配一次凭据**：
+导入完成后它就在本地映像列表里了，直接选中运行即可。
 
-**第一步：拿 Docker Hub 的 Access Token**
-
-1. 注册/登录 <https://hub.docker.com>
-2. <https://hub.docker.com/settings/security> → **New Access Token**
-3. 权限选 **Read & Write**，生成的字符串复制下来（**不是你的登录密码**）
-
-**第二步：把凭据存进 GitHub 仓库**
-
-进 <https://github.com/zltelaii/DouyinLiveRecorder/settings/secrets/actions>
-→ **New repository secret**，加两个：
-
-| 名称 | 值 |
-|---|---|
-| `DOCKERHUB_USERNAME` | 你的 Docker Hub 用户名 |
-| `DOCKERHUB_TOKEN` | 上一步生成的 Access Token |
-
-**第三步：手动跑一次构建**
-
-仓库 → **Actions** → 左侧选 **Publish to Docker Hub** → **Run workflow**
-→ `image_name` 填 `你的用户名/douyin-live-recorder` → 运行。
-
-> 这个 fork 的默认分支已设为 `feature/douyin-danmaku`（弹幕代码在这条分支上），
-> 所以 Actions 页面能直接看到这个 workflow。若某天列表里找不到它，
-> 用页面上方的分支选择器切到 `feature/douyin-danmaku` 即可——
-> GitHub 只展示默认分支上的 workflow。
-
-跑完（约 2 分钟），群晖上就是：
-
-- **注册表** 里搜 `douyin-live-recorder` → 能搜到，点一下就能下载
-- 或者 **映像 → 从 URL 添加** 填 `你的用户名/douyin-live-recorder:latest`
-
-> 仓库名必须是 `用户名/仓库名` 的格式，写成别的会报 `denied`。
-> 另外 Docker Hub 匿名拉取有频率限制（每 IP 6 小时 100 次），个人用远不到上限。
+> - 产物**保留 30 天**，过期后再跑一次构建就有了
+> - 群晖是 **ARM 机型**（DS220j、DS120j、DS418j 等）的话：Actions 页面手动触发
+>   **Export Image Tar**，`platforms` 参数填 `linux/arm64`，下载到的就是 arm64 版本
+> - 想自己打包也行（需要本机有 Docker）：
+>   `docker pull ghcr.io/zltelaii/douyin-live-recorder:latest`
+>   `docker save ghcr.io/zltelaii/douyin-live-recorder:latest -o douyin-recorder.tar`
 
 ### 做法 B：SSH 登录群晖用命令行
 

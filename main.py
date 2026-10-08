@@ -411,8 +411,12 @@ def post_process_video(video_path: str, is_original_delete: bool, ass_path: str 
         burn_danmaku_into_video(final_path, ass_path, video_start=start_time)
 
 
-def post_process_segments(segment_template_path: str, is_original_delete: bool, ass_path: str) -> None:
-    """分段录制下的后半程：逐个片段转码 + 烧录各自区间的弹幕。
+def post_process_segments(segment_template_path: str, is_original_delete: bool, ass_path: str,
+                          need_convert: bool = True) -> None:
+    """分段录制下的后半程：逐个片段处理 + 烧录各自区间的弹幕。
+
+    need_convert 为真时先转码成 mp4 再烧（保存格式是 TS 的情况）；为假时片段
+    本身就是成品（保存格式 mp4/flv/mkv），跳过转码直接烧。
 
     必须串行处理：每一段的字幕起点来自它前面所有段的**实际时长累加**
     （ffmpeg 按关键帧切段，边界不严格等于配置的分段秒数），并行就算不出这个偏移。
@@ -440,8 +444,11 @@ def post_process_segments(segment_template_path: str, is_original_delete: bool, 
 
     offset = 0.0
     for index, path in enumerate(candidates, start=1):
-        converts_mp4(path, is_original_delete)
-        final_path = path.rsplit('.', maxsplit=1)[0] + '.mp4'
+        if need_convert:
+            converts_mp4(path, is_original_delete)
+            final_path = path.rsplit('.', maxsplit=1)[0] + '.mp4'
+        else:
+            final_path = path
         if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
             continue
         start_time, duration = probe_video_info(final_path)
@@ -718,6 +725,13 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     target=post_process_video,
                     args=(save_file_path, delete_origin_file, ass_path if want_burn else None),
                 ).start()
+        elif want_burn and split_video_by_time:
+            # 直接存 mp4/flv/mkv 又开了分段：片段本身就是成品，不用转码，直接逐段烧
+            logger.info('开启分段录制（无转码模式），将逐段把弹幕烧进画面（每段一次重编码，耗时较长）')
+            threading.Thread(
+                target=post_process_segments,
+                args=(save_file_path, False, ass_path, False),
+            ).start()
         elif want_burn and not split_video_by_time:
             # 未开启转码（直接存 mp4/flv 等）时，烧录直接作用于录制产物
             threading.Thread(target=burn_danmaku_into_video, args=(save_file_path, ass_path)).start()

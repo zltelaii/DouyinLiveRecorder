@@ -411,6 +411,14 @@ def burn_danmaku_into_video(video_path: str, ass_path: str, video_start: float =
     base, ext = video_path.rsplit('.', maxsplit=1)
     out_path = f'{base}_弹幕.{ext}'
 
+    # 幂等：产物已存在（上次烧过）就不重烧。启动补烧扫描靠它避免重复劳动。
+    try:
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            logger.info(f'弹幕烧录产物已存在，跳过: {os.path.basename(out_path)}')
+            return
+    except OSError:
+        pass
+
     # ass 滤镜参数里的 Windows 盘符冒号极难转义（实测 `C\:` 会把参数撕碎报
     # "No option name"，引号包裹、双反斜杠也各有兼容性坑），而弹幕文件和视频
     # 本来就在同一目录——直接把工作目录切过去用纯文件名引用，彻底绕开这个坑。
@@ -508,6 +516,12 @@ def post_process_segments(segment_template_path: str, is_original_delete: bool, 
             start_time, duration = probe_video_info(final_path)
             if duration <= 0:
                 duration = 0.0
+            # 已有烧录产物的段直接跳过（启动补烧场景），但时长偏移必须照常累加
+            burned_path = f'{os.path.splitext(final_path)[0]}_弹幕.mp4'
+            if os.path.exists(burned_path) and os.path.getsize(burned_path) > 0:
+                logger.info(f'第 {index}/{len(candidates)} 段已有烧录产物，跳过')
+                offset += duration
+                continue
             if sized_ass == ass_path:
                 # 各段分辨率一致，重排一次就够了
                 sized_ass, temp_ass = ass_matching_video(ass_path, probe_video_size(final_path))
@@ -528,6 +542,63 @@ def post_process_segments(segment_template_path: str, is_original_delete: bool, 
                 os.remove(temp_ass)
             except OSError:
                 pass
+
+
+def scan_and_reburn_missed(download_root: str) -> None:
+    """启动时扫描历史录制目录，把「字幕已生成但没有烧录产物」的场次补烧。
+
+    录制结束后的烧录是重活（每段一次完整重编码），中途重启容器/断电/崩溃都会
+    把它打断，留下的场次字幕齐全却没有 _弹幕.mp4。判断依据很稳：
+    ASS 只在录制结束后才生成，它存在就代表该场已经结束，不会和正在录的场次撞车；
+    再配合 burn_danmaku_into_video 的幂等跳过，重复执行也安全。
+    """
+    if not download_root or not os.path.isdir(download_root):
+        return
+    # 稍等再扫：给启动期的录制拉起留点余量，也避免和刚结束场次的正常烧录抢跑
+    time.sleep(60)
+    if exit_recording:
+        return
+    now = time.time()
+    for dirpath, _dirnames, filenames in os.walk(download_root):
+        for name in filenames:
+            if not name.endswith('.danmaku.ass') or '.danmaku.ass.' in name:
+                continue  # 跳过按分辨率重排的临时 ass（形如 xxx.danmaku.ass.1280x720.ass）
+            ass_path = os.path.join(dirpath, name)
+            try:
+                if now - os.path.getmtime(ass_path) < 600:
+                    continue  # 刚生成的，正常流程马上会自己烧
+            except OSError:
+                continue
+            prefix_path = ass_path[:-len('.danmaku.ass')]
+            if not os.path.exists(prefix_path + '.danmaku.jsonl'):
+                continue
+            base_name = os.path.basename(prefix_path)
+            segments = sorted(
+                p for p in utils.get_file_paths(dirpath)
+                if os.path.basename(p).startswith(base_name + '_')
+                and '_弹幕' not in os.path.basename(p)
+                and '.seg' not in os.path.basename(p)
+                and os.path.splitext(p)[1].lower() == '.mp4'
+            )
+            logger.info(f'发现未烧录的历史录制，开始补烧: {ass_path}')
+            try:
+                if segments:
+                    # post_process_segments 从传入路径提取前缀，所以要带段号传第一个分段
+                    post_process_segments(segments[0], False, ass_path, need_convert=False)
+                else:
+                    single = prefix_path + '.mp4'
+                    if os.path.exists(single):
+                        sized_ass, temp_ass = ass_matching_video(ass_path, probe_video_size(single))
+                        try:
+                            burn_danmaku_into_video(single, sized_ass)
+                        finally:
+                            if temp_ass:
+                                try:
+                                    os.remove(temp_ass)
+                                except OSError:
+                                    pass
+            except Exception as e:
+                logger.error(f'补烧 {ass_path} 失败: {e}')
 
 
 def converts_m4a(converts_file_path: str, is_original_delete: bool = True) -> None:
@@ -2208,8 +2279,16 @@ while True:
     except (TypeError, ValueError):
         danmaku_gift_min_diamond = 0.0
     danmaku_mode = '固定' if '固定' in str(read_config_value(config, '录制设置', '弹幕显示方式(滚动/固定)', "滚动")) else '滚动'
+    danmaku_reburn = options.get(read_config_value(
+        config, '录制设置', '启动时自动补烧遗漏的弹幕(是/否)', "是"), True)
     if danmaku_enabled:
         logger.info("弹幕录制已开启，当前仅支持抖音直播，若缺少依赖请执行: pip install websocket-client protobuf")
+    if danmaku_enabled and danmaku_burn and danmaku_reburn:
+        # 补烧扫描放后台：中断过的场次（重启容器/断电）在下次启动时自动续上
+        threading.Thread(
+            target=scan_and_reburn_missed, args=(video_save_path or default_path,),
+            name='danmaku_reburn_scan', daemon=True,
+        ).start()
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)
     custom_script = read_config_value(config, '录制设置', '自定义脚本执行命令', "") if is_run_script else None
     enable_proxy_platform = read_config_value(

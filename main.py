@@ -346,6 +346,48 @@ def slice_ass_for_segment(ass_path: str, start_sec: float, duration_sec: float, 
     return sum(1 for line in lines if line.startswith('Dialogue:'))
 
 
+def probe_video_size(video_path: str) -> tuple[int, int] | None:
+    """取视频画面的宽高。ASS 的 PlayRes 必须与之一致，否则字幕会被拉伸变形。"""
+    try:
+        output = subprocess.check_output([
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height', '-of', 'csv=p=0', video_path,
+        ], stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type))
+        parts = output.decode('utf-8', errors='ignore').strip().split(',')
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+def ass_matching_video(ass_path: str, size: tuple[int, int] | None) -> tuple[str, str | None]:
+    """按视频分辨率重新渲染一份 ASS，返回 (实际要用的 ass 路径, 需要调用方删除的临时文件)。
+
+    弹幕 ASS 是在录制结束时生成的，那一刻还看不到成品视频的分辨率，只能先按 1080p 排；
+    而抖音有不少竖屏直播（720x1280），直接套上去字幕会被压扁。这里拿 jsonl 里的原始
+    记录按真实宽高重排一遍，row 轨道和时间戳都不变。
+    """
+    if not size:
+        return ass_path, None
+    jsonl_path = None
+    if ass_path.endswith('.danmaku.ass'):
+        jsonl_path = ass_path[: -len('.danmaku.ass')] + '.danmaku.jsonl'
+    if not jsonl_path or not os.path.exists(jsonl_path):
+        return ass_path, None
+    playres = (int(size[0]), int(size[1]))
+    temp_path = f'{ass_path}.{playres[0]}x{playres[1]}.ass'
+    try:
+        written, _dropped = danmaku.render_ass_from_jsonl(
+            jsonl_path, temp_path, danmaku_max_lines, danmaku_duration, danmaku_mode, playres
+        )
+        if written:
+            return temp_path, temp_path
+    except Exception as e:
+        logger.warning(f'按 {playres[0]}x{playres[1]} 重排弹幕失败，沿用原字幕: {e}')
+    return ass_path, None
+
+
 def burn_danmaku_into_video(video_path: str, ass_path: str, video_start: float = 0.0) -> None:
     """把弹幕 ASS 字幕烧进视频画面。
 
@@ -408,7 +450,15 @@ def post_process_video(video_path: str, is_original_delete: bool, ass_path: str 
     final_path = video_path.rsplit('.', maxsplit=1)[0] + '.mp4'
     if os.path.exists(final_path):
         start_time, _duration = probe_video_info(final_path)
-        burn_danmaku_into_video(final_path, ass_path, video_start=start_time)
+        used_ass, temp_ass = ass_matching_video(ass_path, probe_video_size(final_path))
+        try:
+            burn_danmaku_into_video(final_path, used_ass, video_start=start_time)
+        finally:
+            if temp_ass:
+                try:
+                    os.remove(temp_ass)
+                except OSError:
+                    pass
 
 
 def post_process_segments(segment_template_path: str, is_original_delete: bool, ass_path: str,
@@ -442,29 +492,41 @@ def post_process_segments(segment_template_path: str, is_original_delete: bool, 
         logger.warning(f'没有找到待处理的分段视频: {directory}')
         return
 
-    offset = 0.0
-    for index, path in enumerate(candidates, start=1):
-        if need_convert:
-            converts_mp4(path, is_original_delete)
-            final_path = path.rsplit('.', maxsplit=1)[0] + '.mp4'
-        else:
-            final_path = path
-        if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
-            continue
-        start_time, duration = probe_video_info(final_path)
-        if duration <= 0:
-            duration = 0.0
-        seg_ass = f'{os.path.splitext(final_path)[0]}.seg{index:03d}.ass'
-        kept = slice_ass_for_segment(ass_path, offset, duration, seg_ass)
-        logger.info(f'第 {index}/{len(candidates)} 段：命中 {kept} 条弹幕，准备烧录')
-        try:
-            burn_danmaku_into_video(final_path, seg_ass, video_start=start_time)
-        finally:
+    sized_ass = ass_path
+    temp_ass = None
+    try:
+        offset = 0.0
+        for index, path in enumerate(candidates, start=1):
+            if need_convert:
+                converts_mp4(path, is_original_delete)
+                final_path = path.rsplit('.', maxsplit=1)[0] + '.mp4'
+            else:
+                final_path = path
+            if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+                continue
+            start_time, duration = probe_video_info(final_path)
+            if duration <= 0:
+                duration = 0.0
+            if sized_ass == ass_path:
+                # 各段分辨率一致，重排一次就够了
+                sized_ass, temp_ass = ass_matching_video(ass_path, probe_video_size(final_path))
+            seg_ass = f'{os.path.splitext(final_path)[0]}.seg{index:03d}.ass'
+            kept = slice_ass_for_segment(sized_ass, offset, duration, seg_ass)
+            logger.info(f'第 {index}/{len(candidates)} 段：命中 {kept} 条弹幕，准备烧录')
             try:
-                os.remove(seg_ass)
+                burn_danmaku_into_video(final_path, seg_ass, video_start=start_time)
+            finally:
+                try:
+                    os.remove(seg_ass)
+                except OSError:
+                    pass
+            offset += duration
+    finally:
+        if temp_ass:
+            try:
+                os.remove(temp_ass)
             except OSError:
                 pass
-        offset += duration
 
 
 def converts_m4a(converts_file_path: str, is_original_delete: bool = True) -> None:
@@ -654,6 +716,7 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     'sync_start': datetime.datetime.now(),
                     'subtitle_max_lines': danmaku_max_lines,
                     'subtitle_duration': danmaku_duration,
+                    'subtitle_mode': danmaku_mode,
                 },
                 name=f'danmaku_start_{record_name}',
                 daemon=True,
@@ -2135,6 +2198,7 @@ while True:
         danmaku_duration = max(1.0, float(read_config_value(config, '录制设置', '弹幕单条显示时长(秒)', "5")))
     except (TypeError, ValueError):
         danmaku_duration = 5.0
+    danmaku_mode = '固定' if '固定' in str(read_config_value(config, '录制设置', '弹幕显示方式(滚动/固定)', "滚动")) else '滚动'
     if danmaku_enabled:
         logger.info("弹幕录制已开启，当前仅支持抖音直播，若缺少依赖请执行: pip install websocket-client protobuf")
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)

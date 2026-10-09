@@ -9,12 +9,11 @@ WORKDIR /app
 
 # ffmpeg：拉流录制 + 弹幕烧录都要用
 # nodejs：抖音签名通过 PyExecJS 执行 JS，没有 Node 运行时弹幕抓不了
-# fonts-wqy-microhei：ASS 字幕由 libass 现渲染，容器里没有中文字体的话，
-#                     中文弹幕一个字都画不出来（ffmpeg 不报错，画面就是没字幕）
+# fonts-noto-color-emoji：弹幕里带 emoji 时没有它是画不出来的（会变成空白/方块）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg ffmpeg tzdata \
-        fontconfig fonts-wqy-microhei && \
+        fontconfig fonts-wqy-microhei fonts-noto-color-emoji && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \

@@ -274,6 +274,25 @@ def generate_ws_signature(wss_url: str) -> str:
 # 刷满，观众说了什么反而看不到。它们仍完整保留在 jsonl 里，需要的话改这个常量即可。
 SUBTITLE_TYPES = ('chat', 'gift', 'emoji')
 
+# 每类消息用什么样式、前缀什么标记。礼物和表情单独一档，画面上一眼能认出来，
+# 否则它们混在普通评论里看不出区别。
+SUBTITLE_STYLES = {'gift': 'Gift', 'emoji': 'Emoji'}
+SUBTITLE_PREFIX = {
+    'gift': '【礼物】',
+    'emoji': '【表情】',
+    'like': '【点赞】',
+    'member': '【进场】',
+    'social': '【关注】',
+}
+
+
+def subtitle_text(record: dict) -> str:
+    """字幕里显示的单行文本（带类型前缀）。stats 类没有发言人也就会有这个分支。"""
+    prefix = SUBTITLE_PREFIX.get(record.get('type'), '')
+    body = f"{record.get('user', '')}：{record.get('content', '')}" if record.get('type') != 'stats' \
+        else record.get('content', '')
+    return prefix + body
+
 
 def _fmt_srt_time(seconds: float) -> str:
     if seconds < 0:
@@ -325,7 +344,8 @@ def _ass_text_width(text: str, font_size: int = SUBTITLE_FONT_SIZE) -> float:
 
 def render_ass(records: list[dict], ass_path: str, max_lines: int = 4, duration: float = 5.0,
                mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080),
-               font_size: int = SUBTITLE_FONT_SIZE) -> tuple[int, int]:
+               font_size: int = SUBTITLE_FONT_SIZE, types: tuple | list | None = None,
+               gift_min_diamond: float = 0.0) -> tuple[int, int]:
     """把弹幕渲染成 ASS 字幕文件，返回 (写入条数, 丢弃条数)。
 
     mode='scroll'：弹幕从画面右侧滚动到左侧（用 move 标签），多条在不同轨道上同时飘；
@@ -343,6 +363,8 @@ def render_ass(records: list[dict], ass_path: str, max_lines: int = 4, duration:
         align, margin_v = 7, 0
     else:
         align, margin_v = 8, 36
+    font = ass_font_name()
+    gift_size = int(font_size * 1.15)
     header = (
         '[Script Info]\n'
         'ScriptType: v4.00+\n'
@@ -353,7 +375,14 @@ def render_ass(records: list[dict], ass_path: str, max_lines: int = 4, duration:
         '[V4+ Styles]\n'
         'Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, '
         'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
-        f'Style: Danmaku,{ass_font_name()},{font_size},&H00FFFFFF,&H00000000,&H80000000,'
+        # 常规弹幕：白字黑描边
+        f'Style: Danmaku,{font},{font_size},&H00FFFFFF,&H00000000,&H80000000,'
+        f'0,0,1,2,0,{align},0,0,{margin_v},1\n'
+        # 礼物：金色加粗、描边更粗
+        f'Style: Gift,{font},{gift_size},&H0000D7FF,&H00101010,&H80300000,'
+        f'-1,0,1,3,1,{align},0,0,{margin_v},1\n'
+        # 表情（抖音小红心/微笑这类动态表情的名字）：浅黄
+        f'Style: Emoji,{font},{font_size},&H00A0F0FF,&H00101010,&H80000000,'
         f'0,0,1,2,0,{align},0,0,{margin_v},1\n'
         '\n'
         '[Events]\n'
@@ -366,10 +395,27 @@ def render_ass(records: list[dict], ass_path: str, max_lines: int = 4, duration:
     tracks: list[float] = []  # 每条轨道当前的占用结束时间
     dropped = 0
 
+    allowed = None
+    if types:
+        allowed = {str(t).strip().lower() for t in types if str(t).strip()}
+    min_diamond = float(gift_min_diamond or 0)
+    filtered = 0
+
     for r in records:
+        rtype = str(r.get('type') or 'chat').lower()
+        if allowed is not None and rtype not in allowed:
+            continue
+        if rtype == 'gift' and min_diamond > 0:
+            try:
+                diamond = float(r.get('diamond', 0) or 0)
+            except (TypeError, ValueError):
+                diamond = 0.0
+            if diamond < min_diamond:
+                filtered += 1
+                continue
         start = float(r.get('offset', 0) or 0)
-        text = f"{r.get('user', '')}：{r.get('content', '')}" if r.get('type') != 'stats' else r.get('content', '')
-        text = _escape_ass_text(text)
+        style_name = SUBTITLE_STYLES.get(rtype, 'Danmaku')
+        text = _escape_ass_text(subtitle_text(r))
         if not text.strip():
             continue
         slot = None
@@ -396,21 +442,24 @@ def render_ass(records: list[dict], ass_path: str, max_lines: int = 4, duration:
         else:
             tracks[slot] = end
         events.append(
-            f'Dialogue: 0,{_fmt_ass_time(start)},{_fmt_ass_time(end)},Danmaku,row{slot},0,0,0,,{prefix}{text}'
+            f'Dialogue: 0,{_fmt_ass_time(start)},{_fmt_ass_time(end)},{style_name},row{slot},0,0,0,,{prefix}{text}'
         )
 
     with open(ass_path, 'w', encoding='utf-8') as f:
         f.write(header + '\n'.join(events) + '\n')
-    return len(events), dropped
+    return len(events), dropped + filtered
 
 
 def render_ass_from_jsonl(jsonl_path: str, ass_path: str, max_lines: int = 4, duration: float = 5.0,
-                          mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080)) -> tuple[int, int]:
+                          mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080),
+                          types: tuple | list | None = None,
+                          gift_min_diamond: float = 0.0) -> tuple[int, int]:
     """按指定分辨率从 jsonl 重新渲染 ASS。
 
     录像分辨率不一定是 1080p（抖音竖屏直播很常见），对着不分大小写的画面直接套
     固定分辨率的 ASS 会让字幕拉变形，所以烧录前按实际宽高重渲一遍。
     """
+    allowed = tuple(types) if types else SUBTITLE_TYPES
     records = []
     if os.path.exists(jsonl_path):
         with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -422,10 +471,11 @@ def render_ass_from_jsonl(jsonl_path: str, ass_path: str, max_lines: int = 4, du
                     record = json.loads(line)
                 except Exception:
                     continue
-                if record.get('type') in SUBTITLE_TYPES:
+                if record.get('type') in allowed:
                     records.append(record)
     records.sort(key=lambda r: r.get('offset', 0))
-    return render_ass(records, ass_path, max_lines, duration, mode, playres)
+    return render_ass(records, ass_path, max_lines, duration, mode, playres,
+                      types=allowed, gift_min_diamond=gift_min_diamond)
 
 
 def clean_base_path(save_file_path: str) -> str:
@@ -446,7 +496,8 @@ class DanmakuRecorder:
                  cookie: Optional[str] = None, formats=('json',),
                  proxy: Optional[str] = None, sync_start: Optional[datetime] = None,
                  subtitle_max_lines: int = 4, subtitle_duration: float = 5.0,
-                 subtitle_mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080)):
+                 subtitle_mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080),
+                 subtitle_types: tuple | list | None = None, gift_min_diamond: float = 0.0):
         self.room_id = str(room_id)
         self.anchor_name = anchor_name or self.room_id
         self.formats = [f.strip().lower() for f in formats if f.strip()] or ['json']
@@ -459,6 +510,11 @@ class DanmakuRecorder:
         # scroll=滚动飘屏 / fixed=顶部固定逐条替换
         self.subtitle_mode = 'fixed' if str(subtitle_mode).strip().lower() in ('fixed', '固定') else 'scroll'
         self.playres = (int(playres[0]), int(playres[1])) if playres else (1920, 1080)
+        self.subtitle_types = tuple(str(t).strip().lower() for t in (subtitle_types or SUBTITLE_TYPES) if str(t).strip())
+        try:
+            self.gift_min_diamond = float(gift_min_diamond or 0)
+        except (TypeError, ValueError):
+            self.gift_min_diamond = 0.0
         self.base_path = clean_base_path(save_file_path)
 
         self.jsonl_path = f'{self.base_path}.danmaku.jsonl'
@@ -874,21 +930,34 @@ class DanmakuRecorder:
     def _write_subtitles(self) -> None:
         if 'srt' not in self.formats and 'ass' not in self.formats:
             return
-        records = [r for r in self._read_records() if r.get('type') in SUBTITLE_TYPES]
+        records = [r for r in self._read_records() if str(r.get('type') or '').lower() in self.subtitle_types]
         if not records:
             return
         records.sort(key=lambda r: r.get('offset', 0))
+        kept = []
+        for r in records:
+            if str(r.get('type') or '').lower() == 'gift' and self.gift_min_diamond > 0:
+                try:
+                    diamond = float(r.get('diamond', 0) or 0)
+                except (TypeError, ValueError):
+                    diamond = 0.0
+                if diamond < self.gift_min_diamond:
+                    continue
+            kept.append(r)
+        if not kept:
+            return
         if 'srt' in self.formats:
-            self._write_srt(records)
+            self._write_srt(kept)
         if 'ass' in self.formats:
-            self._write_ass(records)
+            self._write_ass(kept)
 
     def _write_srt(self, records: list[dict]) -> None:
         lines = []
+        display_duration = self.subtitle_duration
         for index, r in enumerate(records, start=1):
             start = r.get('offset', 0)
-            end = start + 5
-            text = f"{r.get('user', '')}：{r.get('content', '')}" if r.get('type') != 'stats' else r.get('content', '')
+            end = start + display_duration
+            text = subtitle_text(r)
             lines.append(str(index))
             lines.append(f'{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}')
             lines.append(text)
@@ -902,6 +971,7 @@ class DanmakuRecorder:
         written, dropped = render_ass(
             records, self.ass_path, self.subtitle_max_lines, self.subtitle_duration,
             self.subtitle_mode, self.playres,
+            types=self.subtitle_types, gift_min_diamond=self.gift_min_diamond,
         )
         logger.debug(
             f'弹幕 ASS 字幕已生成: {self.ass_path}'
@@ -923,13 +993,16 @@ def start_danmaku(room_id: str, save_file_path: str, anchor_name: str = '',
                   cookie: Optional[str] = None, formats=('json',),
                   proxy: Optional[str] = None, sync_start: Optional[datetime] = None,
                   subtitle_max_lines: int = 4, subtitle_duration: float = 5.0,
-                  subtitle_mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080)) -> bool:
+                  subtitle_mode: str = 'scroll', playres: tuple[int, int] = (1920, 1080),
+                  subtitle_types: tuple | list | None = None,
+                  gift_min_diamond: float = 0.0) -> bool:
     key = os.path.abspath(clean_base_path(save_file_path))
     with _sessions_lock:
         if key in _sessions:
             return False
         recorder = DanmakuRecorder(room_id, save_file_path, anchor_name, cookie, formats, proxy, sync_start,
-                                   subtitle_max_lines, subtitle_duration, subtitle_mode, playres)
+                                   subtitle_max_lines, subtitle_duration, subtitle_mode, playres,
+                                   subtitle_types, gift_min_diamond)
         ok = recorder.start()
         if ok:
             _sessions[key] = recorder

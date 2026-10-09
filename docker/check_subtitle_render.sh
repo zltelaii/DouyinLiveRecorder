@@ -62,3 +62,39 @@ IFS='|'
 for font in $FONT_NAMES; do
     check "$font"
 done
+
+# emoji 单独看一眼：libass 对彩色位图 emoji 的支持因版本而异，画不出来不算致命
+# （只是弹幕里的表情变成方块），所以这里只报告不失败。
+cat > emoji.ass <<EOF
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Danmaku,Noto Color Emoji,70,&H00FFFFFF,&H00000000,&H80000000,0,0,1,2,0,8,40,40,36,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Danmaku,,0,0,0,,emoji检测
+EOF
+
+ffmpeg -y -v error -i black.mp4 -vf "ass=emoji.ass" \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p emoji.mp4
+
+ffmpeg -v error -i emoji.mp4 -pix_fmt gray -f rawvideo - | python3 -c "
+import sys
+data = sys.stdin.buffer.read()
+w, h = 640, 360
+frame = w * h
+n = len(data) // frame
+if n == 0:
+    print('WARN: emoji 检查没有解出帧')
+    sys.exit(0)
+mid = data[frame * (n // 2):frame * (n // 2 + 1)]
+lit = sum(1 for b in mid if b > 60)
+print(f'Noto Color Emoji -> 帧数={n}, 非黑像素={lit}')
+print('OK: emoji 渲染正常' if lit > 200 else 'WARN: emoji 可能显示为方块（不影响中文弹幕）')
+"

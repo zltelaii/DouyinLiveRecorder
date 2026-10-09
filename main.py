@@ -379,7 +379,8 @@ def ass_matching_video(ass_path: str, size: tuple[int, int] | None) -> tuple[str
     temp_path = f'{ass_path}.{playres[0]}x{playres[1]}.ass'
     try:
         written, _dropped = danmaku.render_ass_from_jsonl(
-            jsonl_path, temp_path, danmaku_max_lines, danmaku_duration, danmaku_mode, playres
+            jsonl_path, temp_path, danmaku_max_lines, danmaku_duration, danmaku_mode, playres,
+            types=danmaku_types, gift_min_diamond=danmaku_gift_min_diamond,
         )
         if written:
             return temp_path, temp_path
@@ -717,6 +718,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     'subtitle_max_lines': danmaku_max_lines,
                     'subtitle_duration': danmaku_duration,
                     'subtitle_mode': danmaku_mode,
+                    'subtitle_types': danmaku_types,
+                    'gift_min_diamond': danmaku_gift_min_diamond,
                 },
                 name=f'danmaku_start_{record_name}',
                 daemon=True,
@@ -2198,6 +2201,12 @@ while True:
         danmaku_duration = max(1.0, float(read_config_value(config, '录制设置', '弹幕单条显示时长(秒)', "5")))
     except (TypeError, ValueError):
         danmaku_duration = 5.0
+    danmaku_types = [t.strip().lower() for t in str(read_config_value(
+        config, '录制设置', '弹幕字幕包含的消息类型(逗号分隔)', "chat,gift,emoji")).replace('，', ',').split(',') if t.strip()]
+    try:
+        danmaku_gift_min_diamond = max(0.0, float(read_config_value(config, '录制设置', '弹幕礼物最低钻石数', "0")))
+    except (TypeError, ValueError):
+        danmaku_gift_min_diamond = 0.0
     danmaku_mode = '固定' if '固定' in str(read_config_value(config, '录制设置', '弹幕显示方式(滚动/固定)', "滚动")) else '滚动'
     if danmaku_enabled:
         logger.info("弹幕录制已开启，当前仅支持抖音直播，若缺少依赖请执行: pip install websocket-client protobuf")
